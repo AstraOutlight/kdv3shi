@@ -307,6 +307,7 @@ return function(Context)
     -- Forward declaration: detachScaleBridge is defined before the production
     -- Head-writer implementation and must close over this local, not a nil global.
     local restoreGelatekHeadWriter = function() end
+    local clearDetachedHeadFollower = function() end
     local function readHiddenNumber(instance, propertyName)
         local getter = gethiddenproperty or gethiddenprop or get_hidden_property
         if type(getter) == "function" then
@@ -2158,6 +2159,7 @@ return function(Context)
             neckBridgeConnection = nil
         end
         restoreGelatekHeadWriter()
+        clearDetachedHeadFollower()
         if physicalAnimatorConnection then
             pcall(function()
                 physicalAnimatorConnection:Disconnect()
@@ -2375,149 +2377,87 @@ return function(Context)
         gelatekHeadWriter.Part1 = nil
     end
 
-    local function writeGelatekHead(
-        physical,
-        physicalTorso,
-        physicalHead,
-        controllerTorsoCFrame,
-        targetHeadCFrame,
-        sampleNow
-    )
-        local part0Name =
-            physical:FindFirstChild("UpperTorso")
-            and "UpperTorso"
-            or "Torso"
-        local constraint, motor =
-            findLimbStyleJointChannels(
-                physical,
-                part0Name,
-                "Head"
-            )
-        local reference = constraint or motor
-        if not reference then
-            return
+    -- Physical head is deliberately NOT joined to the torso.
+    -- A one-attachment world-space servo follows the animated proxy head.
+    local detachedHeadFollower = { Head = nil, Attachment = nil, Position = nil, Orientation = nil }
+
+    clearDetachedHeadFollower = function()
+        for _, key in ipairs({"Position", "Orientation", "Attachment"}) do
+            local instance = detachedHeadFollower[key]
+            if instance then pcall(function() instance:Destroy() end) end
+            detachedHeadFollower[key] = nil
+        end
+        detachedHeadFollower.Head = nil
+        detachedHeadFollower.JointsCleared = false
+    end
+
+    local function writeGelatekHead(physical, physicalTorso, physicalHead,
+        controllerTorsoCFrame, targetHeadCFrame, sampleNow)
+        if detachedHeadFollower.Head ~= physicalHead
+            or not detachedHeadFollower.Attachment
+            or not detachedHeadFollower.Attachment.Parent then
+            clearDetachedHeadFollower()
+            local attachment = Instance.new("Attachment")
+            attachment.Name = "_KDV3DetachedHeadAttachment"
+            attachment.Parent = physicalHead
+
+            local position = Instance.new("AlignPosition")
+            position.Name = "_KDV3DetachedHeadPosition"
+            position.Mode = Enum.PositionAlignmentMode.OneAttachment
+            position.Attachment0 = attachment
+            position.ApplyAtCenterOfMass = true
+            position.MaxForce = 1e9
+            position.MaxVelocity = 1e5
+            position.Responsiveness = 200
+            position.RigidityEnabled = true
+            position.Parent = physicalHead
+
+            local orientation = Instance.new("AlignOrientation")
+            orientation.Name = "_KDV3DetachedHeadOrientation"
+            orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+            orientation.Attachment0 = attachment
+            orientation.MaxTorque = 1e9
+            orientation.MaxAngularVelocity = 1e5
+            orientation.Responsiveness = 200
+            orientation.RigidityEnabled = true
+            orientation.Parent = physicalHead
+
+            detachedHeadFollower.Head = physicalHead
+            detachedHeadFollower.Attachment = attachment
+            detachedHeadFollower.Position = position
+            detachedHeadFollower.Orientation = orientation
         end
 
-        local currentWriters = SaveData.AnimLibOptions.ReplicationWriters
-        local method = tostring(currentWriters.GelatekHead or "CurrentAngle6D")
-
-        if method == "WeldConstraint CFrame0" then
-            setGelatekHeadJointEnabled(constraint, false)
-            if motor and motor ~= constraint then
-                setGelatekHeadJointEnabled(motor, false)
-            end
-
-            local wc = gelatekHeadWriter.WeldConstraint
-            if not wc
-                or not wc.Parent
-                or gelatekHeadWriter.Part0 ~= physicalTorso
-                or gelatekHeadWriter.Part1 ~= physicalHead
-            then
-                restoreGelatekHeadWriter()
-                setGelatekHeadJointEnabled(constraint, false)
-                if motor and motor ~= constraint then
-                    setGelatekHeadJointEnabled(motor, false)
+        -- Remove head-to-torso joints only once per head, not every frame.
+        if not detachedHeadFollower.JointsCleared then
+        for _, descendant in ipairs(physical:GetDescendants()) do
+            if descendant:IsA("JointInstance") then
+                local a, b = descendant.Part0, descendant.Part1
+                if (a == physicalHead and b == physicalTorso)
+                    or (b == physicalHead and a == physicalTorso) then
+                    pcall(function() descendant:Destroy() end)
                 end
-                wc = Instance.new("WeldConstraint")
-                wc.Name = "_UhhhhhhGelatekHeadWriter"
-                wc.Part0 = physicalTorso
-                wc.Part1 = physicalHead
-                wc.Enabled = true
-                wc.Parent = physicalTorso
-                gelatekHeadWriter.WeldConstraint = wc
-                gelatekHeadWriter.Part0 = physicalTorso
-                gelatekHeadWriter.Part1 = physicalHead
-            end
-
-            -- Encode the controller's Torso->Head pose. The physical Torso
-            -- remains the world-space authority.
-            local desiredRelative =
-                controllerTorsoCFrame:ToObjectSpace(targetHeadCFrame)
-            local written, result = pcall(
-                sethiddenproperty,
-                wc,
-                "CFrame0",
-                desiredRelative
-            )
-            if written and result ~= false then
-                return
-            end
-            restoreGelatekHeadWriter()
-            currentWriters.GelatekHead = "CurrentAngle6D"
-            warn("Gelatek weld Head write failed; restored native neck writer")
-        end
-
-        -- The replicated writer preserves the native neck joint and routes
-        -- the mapped pose through both hidden Motor6D replication vectors.
-        -- The normal local Transform path remains active if unsupported.
-        if method == "ReplicateCurrentAngle6D" and motor and motor.Parent then
-            if gelatekHeadWriter.WeldConstraint then
-                restoreGelatekHeadWriter()
-            end
-            setGelatekHeadJointEnabled(constraint, true)
-            if motor ~= constraint then
-                setGelatekHeadJointEnabled(motor, constraint == nil)
-            end
-            local base = physical:FindFirstChild("UpperTorso")
-                and controllerTorsoCFrame * CFrame.new(0, 0.194 * characterScale(), 0)
-                or controllerTorsoCFrame
-            local mapped = computeMappedJointFromCFrames(
-                physical, {Part0 = part0Name, Part1 = "Head", Type = 1},
-                base, targetHeadCFrame
-            )
-            if mapped then
-                local c0, c1 = Util.GetCharacterJointFrames(motor)
-                if c0 and c1 then
-                    local transform = c0:Inverse() * mapped * c1
-                    pcall(function() motor.Transform = transform end)
-                    local axis, angle = transform:ToAxisAngle()
-                    local offsetOK = Util.TrySetHiddenProperty(motor, "ReplicateCurrentOffset6D", transform.Position)
-                    local angleOK = Util.TrySetHiddenProperty(motor, "ReplicateCurrentAngle6D", axis * angle)
-                    if offsetOK and angleOK then return end
+            elseif descendant:IsA("WeldConstraint") then
+                local a, b = descendant.Part0, descendant.Part1
+                if (a == physicalHead and b == physicalTorso)
+                    or (b == physicalHead and a == physicalTorso) then
+                    pcall(function() descendant:Destroy() end)
                 end
             end
-            -- Unsupported hidden properties fall back to the native writer.
         end
 
-        -- CurrentAngle6D is the production/default writer. A native Neck stays
-        -- enabled, making the physical Torso the positional base for Head.
-        if gelatekHeadWriter.WeldConstraint then
-            restoreGelatekHeadWriter()
-        end
-        setGelatekHeadJointEnabled(constraint, true)
-        if motor and motor ~= constraint then
-            setGelatekHeadJointEnabled(motor, constraint == nil)
+        detachedHeadFollower.JointsCleared = true
         end
 
-        if physical:FindFirstChild("UpperTorso") then
-            applyCachedMappedJoint(
-                physical,
-                {
-                    Part0 = "UpperTorso",
-                    Part1 = "Head",
-                    Type = 1,
-                },
-                -- Gelatek puts the physical UpperTorso above the proxy Torso.
-                -- Use that mapped frame as the neck base, including scaling.
-                controllerTorsoCFrame * CFrame.new(0, 0.194 * characterScale(), 0),
-                targetHeadCFrame,
-                "TorsoToHead",
-                sampleNow
-            )
-        else
-            applyCachedMappedJoint(
-                physical,
-                {
-                    Part0 = "Torso",
-                    Part1 = "Head",
-                    Type = 1,
-                },
-                controllerTorsoCFrame,
-                targetHeadCFrame,
-                "TorsoToHead",
-                sampleNow
-            )
-        end
+        pcall(function()
+            physicalHead.Anchored = false
+            physicalHead.CanCollide = false
+            physicalHead.CanTouch = false
+            physicalHead.Massless = false
+            physicalHead.RootPriority = 127
+            detachedHeadFollower.Position.Position = targetHeadCFrame.Position
+            detachedHeadFollower.Orientation.CFrame = targetHeadCFrame.Rotation
+        end)
     end
 
     local function updateNonPDBodyChain(rig)
@@ -2560,35 +2500,11 @@ return function(Context)
             end)
         end
 
-        -- Restore Gelatek's natural non-PD topology: Torso is an independently
-        -- network-animated physical piece. Head remains its Neck child.
+        -- Keep the head physically independent from the torso.
         pcall(function()
             physicalTorso.Massless = false
-            physicalTorso.RootPriority = 127
-            physicalHead.Massless = true
-            physicalHead.RootPriority = -127
+            physicalHead.Massless = false
         end)
-
-        if physicalHumanoid and physicalHumanoid.Health > 0 then
-            local neck = physicalTorso:FindFirstChild("Neck")
-            if not (neck and neck:IsA("Motor6D") and neck.Part0 == physicalTorso and neck.Part1 == physicalHead) then
-                for _, joint in ipairs(physicalTorso:GetChildren()) do
-                    if joint:IsA("Motor6D") and joint.Part0 == physicalTorso and joint.Part1 == physicalHead then
-                        neck = joint
-                        break
-                    end
-                end
-                if not neck then
-                    neck = Instance.new("Motor6D")
-                    neck.Name = "Neck"
-                    neck.Part0 = physicalTorso
-                    neck.Part1 = physicalHead
-                    neck.C0 = CFrame.new(0, 1, 0)
-                    neck.C1 = CFrame.new(0, -0.5, 0)
-                    neck.Parent = physicalTorso
-                end
-            end
-        end
 
         local targetHeadCFrame = controllerHead.CFrame
         if type(Reanimate.ResolveBodyHideTargetCFrame) == "function" then
