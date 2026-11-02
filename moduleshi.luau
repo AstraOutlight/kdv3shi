@@ -230,7 +230,7 @@ return function(Context)
     local replicationWriters = SaveData.AnimLibOptions.ReplicationWriters
     local writerDefaults = {
         GelatekTorso = "Gelatek Physics",
-        GelatekHead = "CurrentAngle6D",
+        GelatekHead = "ReplicateCurrentAngle6D",
         LimbTorso = "CurrentAngle6D",
         LimbHead = "CurrentAngle6D",
         LimbRightArm = "CurrentAngle6D",
@@ -2445,6 +2445,38 @@ return function(Context)
             restoreGelatekHeadWriter()
             currentWriters.GelatekHead = "CurrentAngle6D"
             warn("Gelatek weld Head write failed; restored native neck writer")
+        end
+
+        -- The replicated writer preserves the native neck joint and routes
+        -- the mapped pose through both hidden Motor6D replication vectors.
+        -- The normal local Transform path remains active if unsupported.
+        if method == "ReplicateCurrentAngle6D" and motor and motor.Parent then
+            if gelatekHeadWriter.WeldConstraint then
+                restoreGelatekHeadWriter()
+            end
+            setGelatekHeadJointEnabled(constraint, true)
+            if motor ~= constraint then
+                setGelatekHeadJointEnabled(motor, constraint == nil)
+            end
+            local base = physical:FindFirstChild("UpperTorso")
+                and controllerTorsoCFrame * CFrame.new(0, 0.194 * characterScale(), 0)
+                or controllerTorsoCFrame
+            local mapped = computeMappedJointFromCFrames(
+                physical, {Part0 = part0Name, Part1 = "Head", Type = 1},
+                base, targetHeadCFrame
+            )
+            if mapped then
+                local c0, c1 = Util.GetCharacterJointFrames(motor)
+                if c0 and c1 then
+                    local transform = c0:Inverse() * mapped * c1
+                    pcall(function() motor.Transform = transform end)
+                    local axis, angle = transform:ToAxisAngle()
+                    local offsetOK = Util.TrySetHiddenProperty(motor, "ReplicateCurrentOffset6D", transform.Position)
+                    local angleOK = Util.TrySetHiddenProperty(motor, "ReplicateCurrentAngle6D", axis * angle)
+                    if offsetOK and angleOK then return end
+                end
+            end
+            -- Unsupported hidden properties fall back to the native writer.
         end
 
         -- CurrentAngle6D is the production/default writer. A native Neck stays
@@ -5832,7 +5864,7 @@ warn("Reanimated in " .. string.sub(tostring(tick()-Speed),1,string.find(tostrin
 ]=]
 end
 factories["defaults"] = function()
-return {["Gelatek"]={["BulletLockTorso"]=false,["PermanentDeath"]=false,["DirectPositionCorrection"]=true,["DetailedCredits"]=false,["FullForceAlign"]=false,["ShowMeHowILook"]=false,["DisableDirectionalWalking"]=true,["NonPDRecoveryRadiusPercent"]=5,["RagdollSelfCollision"]=true,["BulletEnabled"]=false,["DynamicalVelocity"]=true,["AlignReanimate"]=true,["DisableTweaks"]=false,["AnimationsDisabled"]=true,["BulletRunAfter"]=false,["RecoverBeforeVoid"]=true,["FasterHeartbeat"]=false,["DontBreakHairWelds"]=true,["LoadLibrary"]=false,["TorsoFling"]=false,["TeleportBackWhenVoided"]=true,["AntiSleep"]=true},["Character"]={["InfiniteJump"]=true,["Noclip"]=false,["SmoothCam"]=true,["FirstPersonBody"]=false,["ShiftlockEnabled"]=false,["SeatSit"]=true,["KeepSeatSitState"]=true,["ToolGrab"]=true,["ScaleGravity"]=true,["PatchmaVoidFloat"]=true,["CharacterScale"]=1,["PlaceholderTransparency"]=1,["ShowResetPlaceholder"]=true,["ShowControllerCharacter"]=false,["NetlessVelocity"]=30,["UseAngularVelocity"]=true,["UsePhysicsRepRootPart"]=true,["CameraFocusPart"]="Root",["WalkSpeed"]=16,["JumpPower"]=50},["Writers"]={["GelatekTorso"]="Gelatek Physics",["GelatekHead"]="CurrentAngle6D"}}
+return {["Gelatek"]={["BulletLockTorso"]=false,["PermanentDeath"]=false,["DirectPositionCorrection"]=true,["DetailedCredits"]=false,["FullForceAlign"]=false,["ShowMeHowILook"]=false,["DisableDirectionalWalking"]=true,["NonPDRecoveryRadiusPercent"]=5,["RagdollSelfCollision"]=true,["BulletEnabled"]=false,["DynamicalVelocity"]=true,["AlignReanimate"]=true,["DisableTweaks"]=false,["AnimationsDisabled"]=true,["BulletRunAfter"]=false,["RecoverBeforeVoid"]=true,["FasterHeartbeat"]=false,["DontBreakHairWelds"]=true,["LoadLibrary"]=false,["TorsoFling"]=false,["TeleportBackWhenVoided"]=true,["AntiSleep"]=true},["Character"]={["InfiniteJump"]=true,["Noclip"]=false,["SmoothCam"]=true,["FirstPersonBody"]=false,["ShiftlockEnabled"]=false,["SeatSit"]=true,["KeepSeatSitState"]=true,["ToolGrab"]=true,["ScaleGravity"]=true,["PatchmaVoidFloat"]=true,["CharacterScale"]=1,["PlaceholderTransparency"]=1,["ShowResetPlaceholder"]=true,["ShowControllerCharacter"]=false,["NetlessVelocity"]=30,["UseAngularVelocity"]=true,["UsePhysicsRepRootPart"]=true,["CameraFocusPart"]="Root",["WalkSpeed"]=16,["JumpPower"]=50},["Writers"]={["GelatekTorso"]="Gelatek Physics",["GelatekHead"]="ReplicateCurrentAngle6D"}}
 
 end
 factories["init"] = function()
@@ -5914,7 +5946,7 @@ function Module.Attach(context)
                     if key=="GelatekTorso" then
                         assert(value=="Gelatek Physics", "torso uses the native Gelatek physics writer")
                     else
-                        assert(value=="CurrentAngle6D" or value=="WeldConstraint CFrame0", "unknown head writer")
+                        assert(value=="CurrentAngle6D" or value=="ReplicateCurrentAngle6D" or value=="WeldConstraint CFrame0", "unknown head writer")
                     end
                 end
                 if key=="CameraFocusPart" then
@@ -6067,7 +6099,7 @@ return function(api)
                 end)
             elseif section=="Writers" then
                 local choices=key=="GelatekTorso" and {"Gelatek Physics"}
-                    or {"CurrentAngle6D", "WeldConstraint CFrame0"}
+                    or {"CurrentAngle6D", "ReplicateCurrentAngle6D", "WeldConstraint CFrame0"}
                 local button=row("TextButton",key..": "..tostring(value))
                 button.Activated:Connect(function()
                     local index=table.find(choices,api:GetSettings().Writers[key]) or 1
